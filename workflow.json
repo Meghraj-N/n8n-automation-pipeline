@@ -1,0 +1,235 @@
+{
+  "name": "Enterprise Data Pipeline — Meghraj Nikalje v2.0",
+  "nodes": [
+    {
+      "id": "trigger_cron",
+      "name": "⏰ Weekly Schedule (Mon 9AM)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [100, 400],
+      "parameters": {
+        "rule": { "interval": [{ "field": "cronExpression", "expression": "0 9 * * 1" }] }
+      },
+      "notes": "Fires every Monday at 09:00 AM IST. Can also be triggered manually."
+    },
+    {
+      "id": "node_init",
+      "name": "🔧 Initialise Run Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 400],
+      "parameters": {
+        "jsCode": "// ── INITIALISE RUN CONTEXT ─────────────────────────────────────\n// Creates a run_id, timestamps, and config for this pipeline execution.\n\nconst now       = new Date();\nconst run_id    = `RUN_${now.toISOString().replace(/[:\\-.TZ]/g, '').slice(0,15)}`;\nconst weekStart = new Date(now); weekStart.setDate(now.getDate() - 7);\n\nreturn [{\n  json: {\n    run_id,\n    pipeline_name:  'enterprise-data-pipeline',\n    triggered_at:   now.toISOString(),\n    week_start:     weekStart.toISOString().slice(0,10),\n    week_end:       now.toISOString().slice(0,10),\n    env:            'production',\n    version:        '2.0.0',\n    config: {\n      api_url:        'https://jsonplaceholder.typicode.com/posts',\n      max_records:    100,\n      min_records:    5,\n      retry_attempts: 3,\n      timeout_ms:     15000\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "node_fetch",
+      "name": "🌐 Fetch Data from API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [580, 400],
+      "parameters": {
+        "url": "={{ $json.config.api_url }}",
+        "method": "GET",
+        "responseFormat": "json",
+        "options": {
+          "timeout": "={{ $json.config.timeout_ms }}",
+          "retry": { "maxTries": 3, "waitBetweenTries": 2000 }
+        }
+      },
+      "notes": "Fetches data from API with automatic retry on failure (3 attempts, 2s delay)."
+    },
+    {
+      "id": "node_validate",
+      "name": "✅ Validate API Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [820, 400],
+      "parameters": {
+        "jsCode": "// ── SCHEMA VALIDATION ──────────────────────────────────────────\n// Validate that the API returned usable data before processing.\n\nconst ctx    = $('🔧 Initialise Run Context').first().json;\nconst raw    = $input.all();\n\nconst errors  = [];\nconst valid   = [];\n\nfor (const item of raw) {\n  const rec = item.json;\n  const recErrors = [];\n\n  // Required field checks\n  if (!rec.id)                      recErrors.push('missing id');\n  if (!rec.title || rec.title.trim() === '') recErrors.push('empty title');\n  if (!rec.body  || rec.body.trim()  === '') recErrors.push('empty body');\n  if (rec.userId === undefined)     recErrors.push('missing userId');\n\n  // Type checks\n  if (rec.id && typeof rec.id !== 'number') recErrors.push('id must be number');\n\n  if (recErrors.length > 0) {\n    errors.push({ id: rec.id, errors: recErrors });\n  } else {\n    valid.push(rec);\n  }\n}\n\nif (valid.length < ctx.config.min_records) {\n  throw new Error(`Validation failed: only ${valid.length} valid records (minimum ${ctx.config.min_records})`);\n}\n\nreturn [{\n  json: {\n    run_id:           ctx.run_id,\n    triggered_at:     ctx.triggered_at,\n    config:           ctx.config,\n    validation: {\n      total_raw:      raw.length,\n      valid_records:  valid.length,\n      invalid_records:errors.length,\n      invalid_details:errors.slice(0, 10),\n      pass_rate:      ((valid.length / raw.length) * 100).toFixed(1) + '%'\n    },\n    rawData: valid\n  }\n}];"
+      }
+    },
+    {
+      "id": "node_quality_check",
+      "name": "🔍 Quality Gate (>80% pass?)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1060, 400],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "conditions": [{
+            "id": "quality_check",
+            "leftValue": "={{ $json.validation.valid_records / $json.validation.total_raw }}",
+            "rightValue": 0.8,
+            "operator": { "type": "number", "operation": "gte" }
+          }],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "node_clean",
+      "name": "🧹 Clean & Transform Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 280],
+      "parameters": {
+        "jsCode": "// ── PROFESSIONAL DATA CLEANING ─────────────────────────────────\nconst input   = $input.first().json;\nconst records = input.rawData;\n\nconst cleaned = records.map(rec => {\n  const title = rec.title.trim().replace(/\\s+/g, ' ');\n  const body  = rec.body.trim().replace(/\\s+/g, ' ');\n\n  // Compute features\n  const wordCount   = body.split(/\\s+/).filter(Boolean).length;\n  const titleLen    = title.length;\n  const sentiment   = wordCount > 30 ? 'long' : wordCount > 15 ? 'medium' : 'short';\n  const userId      = Number(rec.userId);\n\n  return {\n    id:             rec.id,\n    title:          title,\n    title_length:   titleLen,\n    body_preview:   body.substring(0, 120) + (body.length > 120 ? '...' : ''),\n    word_count:     wordCount,\n    content_length: sentiment,\n    user_id:        userId,\n    user_tier:      userId <= 3 ? 'premium' : userId <= 7 ? 'standard' : 'basic',\n    processed_at:   new Date().toISOString()\n  };\n});\n\n// Aggregate stats\nconst totalWords   = cleaned.reduce((s, r) => s + r.word_count, 0);\nconst avgWords     = Math.round(totalWords / cleaned.length);\nconst byTier       = cleaned.reduce((acc, r) => { acc[r.user_tier] = (acc[r.user_tier] || 0) + 1; return acc; }, {});\nconst byContent    = cleaned.reduce((acc, r) => { acc[r.content_length] = (acc[r.content_length] || 0) + 1; return acc; }, {});\nconst uniqueUsers  = [...new Set(cleaned.map(r => r.user_id))].length;\n\nreturn [{\n  json: {\n    run_id:       input.run_id,\n    triggered_at: input.triggered_at,\n    validation:   input.validation,\n    cleaned_data: cleaned,\n    kpis: {\n      total_records:   cleaned.length,\n      unique_users:    uniqueUsers,\n      avg_word_count:  avgWords,\n      by_user_tier:    byTier,\n      by_content_len:  byContent,\n      processing_time: new Date().toISOString()\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "node_quality_fail",
+      "name": "🚨 Quality Gate Failed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 540],
+      "parameters": {
+        "jsCode": "const input = $input.first().json;\nconst msg = `[${input.run_id}] QUALITY GATE FAILED: only ${input.validation.valid_records}/${input.validation.total_raw} records passed validation (required: 80%). Pipeline halted.`;\nconsole.error(msg);\nreturn [{ json: { run_id: input.run_id, status: 'failed', reason: 'quality_gate', message: msg, details: input.validation, timestamp: new Date().toISOString() } }];"
+      }
+    },
+    {
+      "id": "node_split",
+      "name": "📤 Split for Parallel Processing",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [1540, 280],
+      "parameters": { "batchSize": 10, "options": {} },
+      "notes": "Splits cleaned data into batches of 10 for downstream parallel processing."
+    },
+    {
+      "id": "node_aggregate",
+      "name": "🔗 Merge & Aggregate Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 280],
+      "parameters": {
+        "jsCode": "// ── FINAL AGGREGATION ──────────────────────────────────────────\nconst allItems  = $input.all();\nconst allData   = allItems.flatMap(item => Array.isArray(item.json) ? item.json : [item.json]);\n\n// Pass through cleanly merged data\nconst merged    = allData.filter(d => d.id !== undefined);\nconst ctx       = $('🧹 Clean & Transform Data').first().json;\n\nreturn [{\n  json: {\n    run_id:       ctx.run_id,\n    triggered_at: ctx.triggered_at,\n    kpis:         ctx.kpis,\n    validation:   ctx.validation,\n    final_records:merged.length,\n    cleaned_data: merged.slice(0, 50),  // top 50 for report\n    report_ready: true\n  }\n}];"
+      }
+    },
+    {
+      "id": "node_sheets",
+      "name": "📊 Write KPIs → Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.2,
+      "position": [2020, 160],
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName":  { "__rl": true, "value": "Pipeline_Runs", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Run ID":          "={{ $json.run_id }}",
+            "Triggered At":    "={{ $json.triggered_at }}",
+            "Total Records":   "={{ $json.kpis.total_records }}",
+            "Unique Users":    "={{ $json.kpis.unique_users }}",
+            "Avg Word Count":  "={{ $json.kpis.avg_word_count }}",
+            "Valid Records":   "={{ $json.validation.valid_records }}",
+            "Pass Rate":       "={{ $json.validation.pass_rate }}",
+            "Status":          "Success"
+          }
+        }
+      },
+      "notes": "Appends one summary row per pipeline run for audit trail and trend analysis."
+    },
+    {
+      "id": "node_html_report",
+      "name": "📄 Build HTML Email Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2020, 360],
+      "parameters": {
+        "jsCode": "const d    = $input.first().json;\nconst kpis = d.kpis;\nconst rows = d.cleaned_data.slice(0, 15).map(r =>\n  `<tr style=\"background:${r.user_tier==='premium'?'#f0f8ff':r.user_tier==='standard'?'#fff':'#fafafa'}\">\n    <td style=\"padding:7px 12px;border-bottom:1px solid #eee;font-weight:bold\">#${r.id}</td>\n    <td style=\"padding:7px 12px;border-bottom:1px solid #eee\">${r.title.substring(0,45)}...</td>\n    <td style=\"padding:7px 12px;border-bottom:1px solid #eee;text-align:center\">${r.word_count}</td>\n    <td style=\"padding:7px 12px;border-bottom:1px solid #eee;text-align:center\">\n      <span style=\"padding:2px 8px;border-radius:12px;font-size:11px;font-weight:bold;background:${\n        r.user_tier==='premium'?'#1A56A0;color:white':\n        r.user_tier==='standard'?'#27AE60;color:white':'#95a5a6;color:white'\n      }\">${r.user_tier.toUpperCase()}</span>\n    </td>\n  </tr>`\n).join('');\n\nconst tierBreakdown = Object.entries(kpis.by_user_tier || {})\n  .map(([k,v]) => `<li><b>${k}</b>: ${v} records</li>`).join('');\n\nconst html = `<!DOCTYPE html>\n<html>\n<body style=\"font-family:Arial,sans-serif;max-width:720px;margin:auto;background:#f4f4f4;padding:20px\">\n  <div style=\"background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.1)\">\n    <!-- Header -->\n    <div style=\"background:linear-gradient(135deg,#1A56A0,#0d3d7a);padding:28px 32px\">\n      <h1 style=\"color:white;margin:0;font-size:22px\">📊 Weekly Pipeline Report</h1>\n      <p style=\"color:#a8c8f0;margin:6px 0 0;font-size:13px\">Run ID: ${d.run_id} &nbsp;|&nbsp; ${new Date(d.triggered_at).toDateString()}</p>\n    </div>\n    <!-- KPI Cards -->\n    <div style=\"display:flex;gap:0;border-bottom:2px solid #eee\">\n      ${[['Total Records',kpis.total_records,'#1A56A0'],['Unique Users',kpis.unique_users,'#27AE60'],['Avg Word Count',kpis.avg_word_count,'#8E44AD'],['Pass Rate',d.validation.pass_rate,'#E67E22']].map(([label,val,color]) =>\n        `<div style=\"flex:1;padding:20px;text-align:center;border-right:1px solid #eee\">\n          <div style=\"font-size:28px;font-weight:bold;color:${color}\">${val}</div>\n          <div style=\"font-size:11px;color:#888;margin-top:4px;text-transform:uppercase\">${label}</div>\n        </div>`\n      ).join('')}\n    </div>\n    <!-- Tier Breakdown -->\n    <div style=\"padding:20px 32px;background:#f9f9f9;border-bottom:1px solid #eee\">\n      <h3 style=\"color:#333;margin:0 0 10px\">User Tier Breakdown</h3>\n      <ul style=\"margin:0;padding-left:18px;color:#555\">${tierBreakdown}</ul>\n    </div>\n    <!-- Table -->\n    <div style=\"padding:20px 32px\">\n      <h3 style=\"color:#333;margin:0 0 12px\">Top 15 Records (Preview)</h3>\n      <table style=\"width:100%;border-collapse:collapse;font-size:13px\">\n        <thead>\n          <tr style=\"background:#1A56A0;color:white\">\n            <th style=\"padding:10px 12px;text-align:left\">ID</th>\n            <th style=\"padding:10px 12px;text-align:left\">Title</th>\n            <th style=\"padding:10px 12px;text-align:center\">Words</th>\n            <th style=\"padding:10px 12px;text-align:center\">Tier</th>\n          </tr>\n        </thead>\n        <tbody>${rows}</tbody>\n      </table>\n    </div>\n    <!-- Footer -->\n    <div style=\"background:#f0f0f0;padding:14px 32px;text-align:center;font-size:11px;color:#999\">\n      Auto-generated by n8n Enterprise Pipeline v2.0 &nbsp;|&nbsp; Meghraj Nikalje\n    </div>\n  </div>\n</body>\n</html>`;\n\nreturn [{ json: { ...d, html_report: html, email_subject: `Weekly Data Report — ${new Date(d.triggered_at).toDateString()} | ${kpis.total_records} records` } }];"
+      }
+    },
+    {
+      "id": "node_email",
+      "name": "📧 Send Email Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2260, 280],
+      "parameters": {
+        "fromEmail": "your-email@gmail.com",
+        "toEmail":   "stakeholder@company.com",
+        "subject":   "={{ $json.email_subject }}",
+        "emailType": "html",
+        "message":   "={{ $json.html_report }}"
+      }
+    },
+    {
+      "id": "node_slack_success",
+      "name": "💬 Slack — Success Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [2260, 440],
+      "parameters": {
+        "operation": "message",
+        "channel":   "#data-pipeline-alerts",
+        "text":      "✅ *Weekly Pipeline Completed*\n>Run ID: `{{ $json.run_id }}`\n>Records: *{{ $json.kpis.total_records }}* processed | Pass rate: *{{ $json.validation.pass_rate }}*\n>Report emailed to stakeholders.",
+        "otherOptions": {}
+      },
+      "notes": "Sends a success message to Slack #data-pipeline-alerts channel."
+    },
+    {
+      "id": "node_error_handler",
+      "name": "🔥 Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 680],
+      "parameters": {
+        "jsCode": "// ── CENTRALISED ERROR HANDLER ──────────────────────────────────\nconst err = $input.first().json;\nconst ctx = {};\n\nconst errorPayload = {\n  run_id:     err.run_id || 'UNKNOWN',\n  status:     'failed',\n  error_type: err.reason || 'pipeline_error',\n  message:    err.message || JSON.stringify(err),\n  timestamp:  new Date().toISOString(),\n  alert_sent: true\n};\n\nconsole.error('[PIPELINE ERROR]', JSON.stringify(errorPayload, null, 2));\nreturn [{ json: errorPayload }];"
+      }
+    },
+    {
+      "id": "node_slack_error",
+      "name": "🚨 Slack — Error Alert",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.1,
+      "position": [1540, 680],
+      "parameters": {
+        "operation": "message",
+        "channel":   "#data-pipeline-alerts",
+        "text":      "🚨 *Pipeline FAILED* — Immediate attention required\n>Run ID: `{{ $json.run_id }}`\n>Error: {{ $json.message }}\n>Time: {{ $json.timestamp }}",
+        "otherOptions": {}
+      }
+    }
+  ],
+
+  "connections": {
+    "⏰ Weekly Schedule (Mon 9AM)":     { "main": [[{ "node": "🔧 Initialise Run Context",         "type": "main", "index": 0 }]] },
+    "🔧 Initialise Run Context":        { "main": [[{ "node": "🌐 Fetch Data from API",             "type": "main", "index": 0 }]] },
+    "🌐 Fetch Data from API":           { "main": [[{ "node": "✅ Validate API Response",           "type": "main", "index": 0 }]] },
+    "✅ Validate API Response":         { "main": [[{ "node": "🔍 Quality Gate (>80% pass?)",       "type": "main", "index": 0 }]] },
+    "🔍 Quality Gate (>80% pass?)":     { "main": [
+      [{ "node": "🧹 Clean & Transform Data",       "type": "main", "index": 0 }],
+      [{ "node": "🚨 Quality Gate Failed",          "type": "main", "index": 0 }]
+    ]},
+    "🚨 Quality Gate Failed":           { "main": [[{ "node": "🔥 Error Handler",                  "type": "main", "index": 0 }]] },
+    "🧹 Clean & Transform Data":        { "main": [[{ "node": "📤 Split for Parallel Processing",  "type": "main", "index": 0 }]] },
+    "📤 Split for Parallel Processing": { "main": [[{ "node": "🔗 Merge & Aggregate Results",      "type": "main", "index": 0 }]] },
+    "🔗 Merge & Aggregate Results":     { "main": [[
+      { "node": "📊 Write KPIs → Google Sheets",  "type": "main", "index": 0 },
+      { "node": "📄 Build HTML Email Report",     "type": "main", "index": 0 }
+    ]]},
+    "📄 Build HTML Email Report":       { "main": [[
+      { "node": "📧 Send Email Report",            "type": "main", "index": 0 },
+      { "node": "💬 Slack — Success Notification", "type": "main", "index": 0 }
+    ]]},
+    "🔥 Error Handler":                 { "main": [[{ "node": "🚨 Slack — Error Alert",            "type": "main", "index": 0 }]] }
+  },
+
+  "settings": {
+    "executionOrder":        "v1",
+    "saveManualExecutions":  true,
+    "callerPolicy":          "workflowsFromSameOwner",
+    "errorWorkflow":         "",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution":   "all"
+  },
+
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "meghraj-enterprise-pipeline-v2"
+  }
+}
